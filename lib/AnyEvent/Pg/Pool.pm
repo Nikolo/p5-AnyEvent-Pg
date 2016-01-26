@@ -8,6 +8,7 @@ use 5.010;
 
 use Carp qw(verbose croak);
 use Data::Dumper;
+use Guard;
 
 use Method::WeakCallback qw(weak_method_callback);
 use AnyEvent::Pg;
@@ -64,6 +65,7 @@ sub new {
                  current => {},
                  busy => {},
                  idle => {},
+                 in_transaction => {},
                  connecting => {},
                  initializing => {},
                  init_queue_ix => {},
@@ -99,6 +101,59 @@ sub set {
 }
 
 sub _on_start {}
+
+sub begin_transaction {
+    my ($pool, %opts) = @_;
+    $pool->push_query(query => "begin", on_error => $opts{on_error}, on_done => sub {
+        my ($pool_tr, $conn_tr) = @_;
+        my $g_tr = guard {
+            warn "Lost transaction. Rollback!"; 
+            $pool->{in_transaction}->{$conn_tr->{seq}} = $conn_tr->push_query(
+                query    => "rollback", 
+                on_error => sub{ warn "Error rollback. Connection lost!" }, 
+                on_done  => sub {
+                    my ($conn) = @_;
+                    warn "Transaction rollback";
+                    delete $pool->{in_transaction}->{$conn->{seq}};
+                }
+	    );
+        };
+        $pool_tr->{in_transaction}->{$conn_tr->{seq}} = 1;
+        $opts{on_done}->($g_tr, @_);
+    });
+}
+
+sub commit_transaction {
+    my ($pool, %opts) = @_;
+    die "Not in transaction" unless exists $pool->{in_transaction}->{$opts{seq}};
+    my $query = {query => "commit"};
+    $query{$_} = delete $opts{$_} for qw(args max_retries);
+    for my $cb (qw(on_result on_error on_done)) {
+        $query{$cb} = sub {
+            my ($conn) = @_; 
+            delete $pool->{in_transaction}->{$conn->{seq}}; 
+            $opts{guard}->cancel(); 
+            $opts{$cb}->(@_);
+        };
+    }
+    $pool->{conns}->{$opts{seq}}->push_query($query);
+}
+
+sub rollback_transaction {
+    my ($pool, %opts) = @_;
+    die "Not in transaction" unless exists $pool->{in_transaction}->{$opts{seq}};
+    my $query = {query => "rollback"};
+    $query{$_} = delete $opts{$_} for qw(args max_retries);
+    for my $cb (qw(on_result on_error on_done)) {
+        $query{$cb} = sub {
+            my ($conn) = @_; 
+            delete $pool->{in_transaction}->{$conn->{seq}}; 
+            $opts{guard}->cancel(); 
+            $opts{$cb}->(@_);
+        };
+    }
+    $pool->{conns}->{$opts{seq}}->push_query($query);
+}
 
 sub push_query {
     my ($pool, %opts) = @_;
@@ -566,6 +621,8 @@ sub _check_init_queue {
 sub _on_conn_empty_queue {
     my ($pool, $seq, $conn) = @_;
     $debug and $debug & 8 and $pool->_debug("conn $conn queue is now empty, seq: $seq");
+
+    return if exists $pool->{in_transaction}->{$seq};
 
     unless (delete $pool->{busy}{$seq} or
             delete $pool->{connecting}{$seq} or
